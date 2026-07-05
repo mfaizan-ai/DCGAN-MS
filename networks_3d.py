@@ -4,21 +4,25 @@ import torch
 import torch.nn.functional as F
 import torchvision
 from torch.nn.utils import weight_norm
-# from MetaAconC import MetaAconC
-import numpy as np
-try:
-    from itertools import izip as zip
-except ImportError: # will be 3.x series
-    pass
-import torch.fft as fft
 
-##################################################################################
-# Discriminator
-##################################################################################
+# Volume-wise (3D) adaptation of networks.py. Every conv/pool/pad/norm op that
+# was 2D (operating on (B, C, H, W) slices) is swapped for its 3D counterpart
+# (operating on (B, C, X, Y, Z) volumes). The architecture, layer counts and
+# forward logic are otherwise unchanged from the published model.
+
 
 class MsImageDis(nn.Module):
-    # Multi-scale discriminator architecture
+    """Multi-scale discriminator: independent PatchGAN CNNs run on the volume
+    at several downsampled scales, and their scores are combined by the caller.
+    """
+
     def __init__(self, input_dim, params):
+        """
+        Args:
+            input_dim: int, number of channels of the input volume.
+            params: dict with keys n_layer, gan_type, dim, norm, activ,
+                num_scales, pad_type (same meaning as the published 2D model).
+        """
         super(MsImageDis, self).__init__()
         self.n_layer = params['n_layer']
         self.gan_type = params['gan_type']
@@ -28,23 +32,25 @@ class MsImageDis(nn.Module):
         self.num_scales = params['num_scales']
         self.pad_type = params['pad_type']
         self.input_dim = input_dim
-        self.downsample = nn.AvgPool2d(3, stride=2, padding=[1, 1], count_include_pad=False)
+        self.downsample = nn.AvgPool3d(3, stride=2, padding=[1, 1, 1], count_include_pad=False)
         self.cnns = nn.ModuleList()
         for _ in range(self.num_scales):
             self.cnns.append(self._make_net())
 
     def _make_net(self):
+        """Build one scale's PatchGAN CNN. Returns an nn.Sequential."""
         dim = self.dim
         cnn_x = []
-        cnn_x += [Conv2dBlock(self.input_dim, dim, 4, 2, 1, norm='none', activation=self.activ, pad_type=self.pad_type)]
+        cnn_x += [Conv3dBlock(self.input_dim, dim, 4, 2, 1, norm='none', activation=self.activ, pad_type=self.pad_type)]
         for _ in range(self.n_layer - 1):
-            cnn_x += [Conv2dBlock(dim, dim * 2, 4, 2, 1, norm=self.norm, activation=self.activ, pad_type=self.pad_type)]
+            cnn_x += [Conv3dBlock(dim, dim * 2, 4, 2, 1, norm=self.norm, activation=self.activ, pad_type=self.pad_type)]
             dim *= 2
-        cnn_x += [nn.Conv2d(dim, 1, 1, 1, 0)]
+        cnn_x += [nn.Conv3d(dim, 1, 1, 1, 0)]
         cnn_x = nn.Sequential(*cnn_x)
         return cnn_x
 
     def forward(self, x):
+        """Run every scale on x, downsampling x between scales. Returns list of score maps."""
         outputs = []
         for model in self.cnns:
             outputs.append(model(x))
@@ -52,7 +58,7 @@ class MsImageDis(nn.Module):
         return outputs
 
     def calc_dis_loss(self, input_fake, input_real):
-        # calculate the loss to train D
+        """LSGAN/NSGAN discriminator loss, summed over scales."""
         outs0 = self.forward(input_fake)
         outs1 = self.forward(input_real)
         loss = 0
@@ -70,12 +76,12 @@ class MsImageDis(nn.Module):
         return loss
 
     def calc_gen_loss(self, input_fake):
-        # calculate the loss to train G
+        """LSGAN/NSGAN generator adversarial loss, summed over scales."""
         outs0 = self.forward(input_fake)
         loss = 0
         for it, (out0) in enumerate(outs0):
             if self.gan_type == 'lsgan':
-                loss += torch.mean((out0 - 1)**2) # LSGAN
+                loss += torch.mean((out0 - 1)**2)
             elif self.gan_type == 'nsgan':
                 all1 = Variable(torch.ones_like(out0.data).cuda(), requires_grad=False)
                 loss += torch.mean(F.binary_cross_entropy(F.sigmoid(out0), all1))
@@ -83,10 +89,9 @@ class MsImageDis(nn.Module):
                 assert 0, "Unsupported GAN type: {}".format(self.gan_type)
         return loss
 
-####################################################################
-#--------------------- Spectral Normalization ---------------------
-#  This part of code is copied from pytorch master branch (0.5.0)
-####################################################################
+
+# Spectral norm reshapes the weight to (out_channels, -1) before power iteration,
+# so it already works for Conv3d weights unchanged - copied verbatim.
 class SpectralNorm(object):
     def __init__(self, name='weight', n_power_iterations=1, dim=0, eps=1e-12):
         self.name = name
@@ -96,12 +101,12 @@ class SpectralNorm(object):
                        'got n_power_iterations={}'.format(n_power_iterations))
         self.n_power_iterations = n_power_iterations
         self.eps = eps
+
     def compute_weight(self, module):
         weight = getattr(module, self.name + '_orig')
         u = getattr(module, self.name + '_u')
         weight_mat = weight
         if self.dim != 0:
-        # permute dim to front
             weight_mat = weight_mat.permute(self.dim,
                                             *[d for d in range(weight_mat.dim()) if d != self.dim])
         height = weight_mat.size(0)
@@ -113,12 +118,14 @@ class SpectralNorm(object):
                 sigma = torch.dot(u, torch.matmul(weight_mat, v))
                 weight = weight / sigma
             return weight, u
+
     def remove(self, module):
         weight = getattr(module, self.name)
         delattr(module, self.name)
         delattr(module, self.name + '_u')
         delattr(module, self.name + '_orig')
         module.register_parameter(self.name, torch.nn.Parameter(weight))
+
     def __call__(self, module, inputs):
         if module.training:
             weight, u = self.compute_weight(module)
@@ -127,6 +134,7 @@ class SpectralNorm(object):
         else:
             r_g = getattr(module, self.name + '_orig').requires_grad
             getattr(module, self.name).detach_().requires_grad_(r_g)
+
     @staticmethod
     def apply(module, name, n_power_iterations, dim, eps):
         fn = SpectralNorm(name, n_power_iterations, dim, eps)
@@ -139,6 +147,8 @@ class SpectralNorm(object):
         module.register_buffer(fn.name + "_u", u)
         module.register_forward_pre_hook(fn)
         return fn
+
+
 def spectral_norm(module, name='weight', n_power_iterations=1, eps=1e-12, dim=None):
     if dim is None:
         if isinstance(module, (torch.nn.ConvTranspose1d,
@@ -150,37 +160,42 @@ def spectral_norm(module, name='weight', n_power_iterations=1, eps=1e-12, dim=No
     SpectralNorm.apply(module, name, n_power_iterations, dim, eps)
     return module
 
-class LeakyReLUConv2d(nn.Module):
+
+class LeakyReLUConv3d(nn.Module):
+    """Reflection-padded 3D conv + LeakyReLU, used by Dis_content."""
+
     def __init__(self, n_in, n_out, kernel_size, stride, padding=0, norm='None', sn=False):
-        super(LeakyReLUConv2d, self).__init__()
+        super(LeakyReLUConv3d, self).__init__()
         model = []
-        model += [nn.ReflectionPad2d(padding)]
+        model += [nn.ReflectionPad3d(padding)]
         if sn:
-            model += [spectral_norm(nn.Conv2d(n_in, n_out, kernel_size=kernel_size, stride=stride, padding=0, bias=True))]
+            model += [spectral_norm(nn.Conv3d(n_in, n_out, kernel_size=kernel_size, stride=stride, padding=0, bias=True))]
         else:
-            model += [nn.Conv2d(n_in, n_out, kernel_size=kernel_size, stride=stride, padding=0, bias=True)]
+            model += [nn.Conv3d(n_in, n_out, kernel_size=kernel_size, stride=stride, padding=0, bias=True)]
         if 'norm' == 'Instance':
-            model += [nn.InstanceNorm2d(n_out, affine=False)]
+            model += [nn.InstanceNorm3d(n_out, affine=False)]
         model += [nn.LeakyReLU(inplace=True)]
         self.model = nn.Sequential(*model)
-        # self.model.apply(gaussian_weights_init)
-        #elif == 'Group'
+
     def forward(self, x):
         return self.model(x)
-####################################################################
-#------------------------- Discriminators --------------------------
-####################################################################
+
+
 class Dis_content(nn.Module):
+    """Content discriminator: tells apart domain A/B shared-content codes.
+    Instantiated in networks.py's original trainer but not wired into its
+    optimizer/forward pass there either - kept for architectural parity.
+    """
+
     def __init__(self):
         super(Dis_content, self).__init__()
         model = []
-        model += [LeakyReLUConv2d(256, 256, kernel_size=3, stride=2, padding=1, norm='None')] # Instance
-        model += [LeakyReLUConv2d(256, 256, kernel_size=3, stride=2, padding=1, norm='None')]
-        model += [LeakyReLUConv2d(256, 256, kernel_size=3, stride=2, padding=1, norm='None')]
-        model += [LeakyReLUConv2d(256, 256, kernel_size=3, stride=2, padding=1, norm='None')]
-        # model += [LeakyReLUConv2d(256, 256, kernel_size=4, stride=1, padding=0)]
-        model += [nn.AdaptiveAvgPool2d(1)]
-        model += [nn.Conv2d(256, 1, kernel_size=1, stride=1, padding=0)]
+        model += [LeakyReLUConv3d(256, 256, kernel_size=3, stride=2, padding=1, norm='None')]
+        model += [LeakyReLUConv3d(256, 256, kernel_size=3, stride=2, padding=1, norm='None')]
+        model += [LeakyReLUConv3d(256, 256, kernel_size=3, stride=2, padding=1, norm='None')]
+        model += [LeakyReLUConv3d(256, 256, kernel_size=3, stride=2, padding=1, norm='None')]
+        model += [nn.AdaptiveAvgPool3d(1)]
+        model += [nn.Conv3d(256, 1, kernel_size=1, stride=1, padding=0)]
         self.model = nn.Sequential(*model)
 
     def forward(self, x):
@@ -188,12 +203,18 @@ class Dis_content(nn.Module):
         out = out.view(-1)
         return out
 
-##################################################################################
-# Generator
-##################################################################################
+
 class VAEGen(nn.Module):
-    # VAE architecture
+    """UNIT-style auto-encoder: shared content encoder + per-domain style
+    (noise) encoder, with a content-only decoder and a content+style decoder.
+    """
+
     def __init__(self, input_dim, params):
+        """
+        Args:
+            input_dim: int, number of channels of the input volume.
+            params: dict with keys dim, n_downsample, n_res, activ, pad_type.
+        """
         super(VAEGen, self).__init__()
         dim = params['dim']
         n_downsample = params['n_downsample']
@@ -201,93 +222,83 @@ class VAEGen(nn.Module):
         activ = params['activ']
         pad_type = params['pad_type']
 
-        # content encoder
-        # Replace traditional instance normalization layer (IN) for image translation with batch normalization (BN). 
-        self.enc = ContentEncoder(n_downsample, n_res, input_dim, dim, 'bn', activ, pad_type=pad_type) # replace 'in' with 'bn'
-        self.styc = NoiseEncoder(n_downsample, input_dim, dim, self.enc.output_dim, 'bn', activ, pad_type = pad_type) # use similar codes with style encoder
-        self.dec_cont = Decoder(n_downsample, n_res, self.enc.output_dim, input_dim, res_norm='bn', activ=activ, pad_type=pad_type) # 'in'
-        self.dec_recs = Decoder(n_downsample, n_res, 2 * self.enc.output_dim, input_dim, res_norm='bn', activ=activ, pad_type=pad_type) # 'in'
+        self.enc = ContentEncoder(n_downsample, n_res, input_dim, dim, 'bn', activ, pad_type=pad_type)
+        self.styc = NoiseEncoder(n_downsample, input_dim, dim, self.enc.output_dim, 'bn', activ, pad_type=pad_type)
+        self.dec_cont = Decoder(n_downsample, n_res, self.enc.output_dim, input_dim, res_norm='bn', activ=activ, pad_type=pad_type)
+        self.dec_recs = Decoder(n_downsample, n_res, 2 * self.enc.output_dim, input_dim, res_norm='bn', activ=activ, pad_type=pad_type)
 
     def encode_cont(self, images):
-        hiddens = self.enc(images)
-        return hiddens
+        return self.enc(images)
 
     def encode_sty(self, images):
-        styhiddens = self.styc(images)
-        return styhiddens
-    
+        return self.styc(images)
+
     def decode_cont(self, hiddens):
-        images = self.dec_cont(hiddens)
-        return images
+        return self.dec_cont(hiddens)
 
     def decode_recs(self, hiddens):
-        images = self.dec_recs(hiddens)
-        return images
+        return self.dec_recs(hiddens)
 
-##################################################################################
-# Encoder and Decoders
-##################################################################################
 
 class NoiseEncoder(nn.Module):
+    """Style/noise encoder: downsamples the volume to a spatial code of
+    style_dim channels (no global pooling, matching the published encoder).
+    """
+
     def __init__(self, n_downsample, input_dim, dim, style_dim, norm, activ, pad_type):
         super(NoiseEncoder, self).__init__()
         self.model = []
-        self.model += [Conv2dBlock(input_dim, dim, 7, 1, 3, norm=norm, activation=activ, pad_type=pad_type)]
+        self.model += [Conv3dBlock(input_dim, dim, 7, 1, 3, norm=norm, activation=activ, pad_type=pad_type)]
         for _ in range(2):
-            self.model += [Conv2dBlock(dim, 2 * dim, 4, 2, 1, norm=norm, activation=activ, pad_type=pad_type)]
+            self.model += [Conv3dBlock(dim, 2 * dim, 4, 2, 1, norm=norm, activation=activ, pad_type=pad_type)]
             dim *= 2
         for i in range(n_downsample - 2):
-            self.model += [Conv2dBlock(dim, dim, 4, 2, 1, norm=norm, activation=activ, pad_type=pad_type)]
-        # self.model += [nn.AdaptiveAvgPool2d(1)] # global average pooling
-        self.model += [nn.Conv2d(dim, style_dim, 1, 1, 0)]
+            self.model += [Conv3dBlock(dim, dim, 4, 2, 1, norm=norm, activation=activ, pad_type=pad_type)]
+        self.model += [nn.Conv3d(dim, style_dim, 1, 1, 0)]
         self.model = nn.Sequential(*self.model)
         self.output_dim = dim
 
     def forward(self, x):
         return self.model(x)
 
+
 class ContentEncoder(nn.Module):
+    """Shared content encoder: downsampling conv stack followed by residual blocks."""
+
     def __init__(self, n_downsample, n_res, input_dim, dim, norm, activ, pad_type):
         super(ContentEncoder, self).__init__()
         self.model = []
-        self.model += [Conv2dBlock(input_dim, dim, 7, 1, 3, norm=norm, activation=activ, pad_type=pad_type)]
-        # downsampling blocks
+        self.model += [Conv3dBlock(input_dim, dim, 7, 1, 3, norm=norm, activation=activ, pad_type=pad_type)]
         for _ in range(n_downsample):
-            self.model += [Conv2dBlock(dim, 2 * dim, 4, 2, 1, norm=norm, activation=activ, pad_type=pad_type)]
+            self.model += [Conv3dBlock(dim, 2 * dim, 4, 2, 1, norm=norm, activation=activ, pad_type=pad_type)]
             dim *= 2
-        # residual blocks
         self.model += [ResBlocks(n_res, dim, norm=norm, activation=activ, pad_type=pad_type)]
         self.model = nn.Sequential(*self.model)
         self.output_dim = dim
 
     def forward(self, x):
         return self.model(x)
-    
 
 
 class Decoder(nn.Module):
+    """Residual blocks followed by nearest/trilinear upsampling back to volume resolution."""
+
     def __init__(self, n_upsample, n_res, dim, output_dim, res_norm='adain', activ='relu', pad_type='zero'):
         super(Decoder, self).__init__()
 
         self.model = []
-        # AdaIN residual blocks
         self.model += [ResBlocks(n_res, dim, res_norm, activ, pad_type=pad_type)]
-        # upsampling blocks
         for _ in range(n_upsample):
             self.model += [nn.Upsample(scale_factor=2),
-                           Conv2dBlock(dim, dim // 2, 5, 1, 2, norm='ln', activation=activ, pad_type=pad_type)]
+                           Conv3dBlock(dim, dim // 2, 5, 1, 2, norm='ln', activation=activ, pad_type=pad_type)]
             dim //= 2
-        # use reflection padding in the last conv layer
-        self.model += [Conv2dBlock(dim, output_dim, 7, 1, 3, norm='none', activation='sigmoid', pad_type=pad_type)] # tanh
-        # self.model += [Conv2dBlock(dim, output_dim, 7, 1, 3, norm='none', activation='tanh', pad_type=pad_type)] # tanh
+        self.model += [Conv3dBlock(dim, output_dim, 7, 1, 3, norm='none', activation='sigmoid', pad_type=pad_type)]
         self.model = nn.Sequential(*self.model)
 
     def forward(self, x):
         return self.model(x)
 
-##################################################################################
-# Sequential Models
-##################################################################################
+
 class ResBlocks(nn.Module):
     def __init__(self, num_blocks, dim, norm='in', activation='relu', pad_type='zero'):
         super(ResBlocks, self).__init__()
@@ -299,30 +310,30 @@ class ResBlocks(nn.Module):
     def forward(self, x):
         return self.model(x)
 
+
+# MLP/LinearBlock operate on flattened feature vectors (nn.Linear), so they
+# have no spatial dimension to adapt - unchanged from the published model.
 class MLP(nn.Module):
     def __init__(self, input_dim, output_dim, dim, n_blk, norm='none', activ='relu'):
-
         super(MLP, self).__init__()
         self.model = []
         self.model += [LinearBlock(input_dim, dim, norm=norm, activation=activ)]
         for _ in range(n_blk - 2):
             self.model += [LinearBlock(dim, dim, norm=norm, activation=activ)]
-        self.model += [LinearBlock(dim, output_dim, norm='none', activation='none')] # no output activations
+        self.model += [LinearBlock(dim, output_dim, norm='none', activation='none')]
         self.model = nn.Sequential(*self.model)
 
     def forward(self, x):
         return self.model(x.view(x.size(0), -1))
 
-##################################################################################
-# Basic Blocks
-##################################################################################
+
 class ResBlock(nn.Module):
     def __init__(self, dim, norm='in', activation='relu', pad_type='zero'):
         super(ResBlock, self).__init__()
 
         model = []
-        model += [Conv2dBlock(dim ,dim, 3, 1, 1, norm=norm, activation=activation, pad_type=pad_type)]
-        model += [Conv2dBlock(dim ,dim, 3, 1, 1, norm=norm, activation='none', pad_type=pad_type)]
+        model += [Conv3dBlock(dim, dim, 3, 1, 1, norm=norm, activation=activation, pad_type=pad_type)]
+        model += [Conv3dBlock(dim, dim, 3, 1, 1, norm=norm, activation='none', pad_type=pad_type)]
         self.model = nn.Sequential(*model)
 
     def forward(self, x):
@@ -331,34 +342,33 @@ class ResBlock(nn.Module):
         out += residual
         return out
 
-class Conv2dBlock(nn.Module):
-    def __init__(self, input_dim , output_dim, kernel_size, stride,
+
+class Conv3dBlock(nn.Module):
+    """Pad + Conv3d + norm + activation, the basic building block of every encoder/decoder."""
+
+    def __init__(self, input_dim, output_dim, kernel_size, stride,
                  padding=0, norm='none', activation='relu', pad_type='zero'):
-        super(Conv2dBlock, self).__init__()
+        super(Conv3dBlock, self).__init__()
         self.use_bias = True
-        # initialize convolution
-        self.conv = nn.Conv2d(input_dim, output_dim, kernel_size, stride, bias=self.use_bias)
-        # initialize padding
+        self.conv = nn.Conv3d(input_dim, output_dim, kernel_size, stride, bias=self.use_bias)
         if pad_type == 'reflect':
-            self.pad = nn.ReflectionPad2d(padding)
+            self.pad = nn.ReflectionPad3d(padding)
         elif pad_type == 'replicate':
-            self.pad = nn.ReplicationPad2d(padding)
+            self.pad = nn.ReplicationPad3d(padding)
         elif pad_type == 'zero':
-            self.pad = nn.ZeroPad2d(padding)
+            self.pad = nn.ZeroPad3d(padding)
         else:
             assert 0, "Unsupported padding type: {}".format(pad_type)
         self.norm_type = norm
-        # initialize normalization
         norm_dim = output_dim
         if norm == 'bn':
-            self.norm = nn.BatchNorm2d(norm_dim)
+            self.norm = nn.BatchNorm3d(norm_dim)
         elif norm == 'in':
-            #self.norm = nn.InstanceNorm2d(norm_dim, track_running_stats=True)
-            self.norm = nn.InstanceNorm2d(norm_dim)
+            self.norm = nn.InstanceNorm3d(norm_dim)
         elif norm == 'ln':
             self.norm = LayerNorm(norm_dim)
         elif norm == 'adain':
-            self.norm = AdaptiveInstanceNorm2d(norm_dim)
+            self.norm = AdaptiveInstanceNorm3d(norm_dim)
         elif norm == 'wn':
             self.conv = weight_norm(self.conv)
         elif norm == 'none':
@@ -366,9 +376,6 @@ class Conv2dBlock(nn.Module):
         else:
             assert 0, "Unsupported normalization: {}".format(norm)
 
-        # self.acon = MetaAconC(width = output_dim)
-
-        # initialize activation
         if activation == 'relu':
             self.activation = nn.ReLU(inplace=True)
         elif activation == 'lrelu':
@@ -390,20 +397,17 @@ class Conv2dBlock(nn.Module):
         x = self.conv(self.pad(x))
         if self.norm_type != 'wn' and self.norm != None:
             x = self.norm(x)
-
         if self.activation:
             x = self.activation(x)
-            # x = self.acon(x)
         return x
+
 
 class LinearBlock(nn.Module):
     def __init__(self, input_dim, output_dim, norm='none', activation='relu'):
         super(LinearBlock, self).__init__()
         use_bias = True
-        # initialize fully connected layer
         self.fc = nn.Linear(input_dim, output_dim, bias=use_bias)
 
-        # initialize normalization
         norm_dim = output_dim
         if norm == 'bn':
             self.norm = nn.BatchNorm1d(norm_dim)
@@ -416,7 +420,6 @@ class LinearBlock(nn.Module):
         else:
             assert 0, "Unsupported normalization: {}".format(norm)
 
-        # initialize activation
         if activation == 'relu':
             self.activation = nn.ReLU(inplace=True)
         elif activation == 'lrelu':
@@ -441,31 +444,34 @@ class LinearBlock(nn.Module):
         return out
 
 
-
 class vgg_19(nn.Module):
+    """VGG19 perceptual-loss feature extractor - left as a 2D, ImageNet-pretrained
+    network. There is no pretrained 3D equivalent, so this cannot be "adapted"
+    the way the conv ops above were; it needs an explicit decision later
+    (e.g. disable vgg_w for volumes, or run it per-slice on the volume) rather
+    than being silently changed here.
+    """
+
     def __init__(self):
         super(vgg_19, self).__init__()
         vgg_model = torchvision.models.vgg19(pretrained=True)
         self.feature_ext = nn.Sequential(*list(vgg_model.features.children())[:20])
+
     def forward(self, x):
         if x.size(1) == 1:
             x = torch.cat((x, x, x), 1)
         out = self.feature_ext(x)
         return out
 
-##################################################################################
-# Normalization layers
-##################################################################################
-class AdaptiveInstanceNorm2d(nn.Module):
+
+class AdaptiveInstanceNorm3d(nn.Module):
     def __init__(self, num_features, eps=1e-5, momentum=0.1):
-        super(AdaptiveInstanceNorm2d, self).__init__()
+        super(AdaptiveInstanceNorm3d, self).__init__()
         self.num_features = num_features
         self.eps = eps
         self.momentum = momentum
-        # weight and bias are dynamically assigned
         self.weight = None
         self.bias = None
-        # just dummy buffers, not used
         self.register_buffer('running_mean', torch.zeros(num_features))
         self.register_buffer('running_var', torch.ones(num_features))
 
@@ -475,7 +481,6 @@ class AdaptiveInstanceNorm2d(nn.Module):
         running_mean = self.running_mean.repeat(b)
         running_var = self.running_var.repeat(b)
 
-        # Apply instance norm
         x_reshaped = x.contiguous().view(1, b * c, *x.size()[2:])
 
         out = F.batch_norm(
@@ -488,6 +493,8 @@ class AdaptiveInstanceNorm2d(nn.Module):
         return self.__class__.__name__ + '(' + str(self.num_features) + ')'
 
 
+# Already dimension-agnostic (normalizes over all non-batch dims via a flattened
+# view), so it works unchanged for 3D volumes - kept verbatim.
 class LayerNorm(nn.Module):
     def __init__(self, num_features, eps=1e-5, affine=True):
         super(LayerNorm, self).__init__()
@@ -501,11 +508,6 @@ class LayerNorm(nn.Module):
 
     def forward(self, x):
         shape = [-1] + [1] * (x.dim() - 1)
-        # if x.size(0) == 1:
-        #     # These two lines run much faster in pytorch 0.4 than the two lines listed below.
-        #     mean = x.view(-1).mean().view(*shape)
-        #     std = x.view(-1).std().view(*shape)
-        # else:
         mean = x.view(x.size(0), -1).mean(1).view(*shape)
         std = x.view(x.size(0), -1).std(1).view(*shape)
 
@@ -516,140 +518,24 @@ class LayerNorm(nn.Module):
             x = x * self.gamma.view(*shape) + self.beta.view(*shape)
         return x
 
-# diff: add random downsampling
 
-##################################################################################
-# Mask Generator
-##################################################################################
-class GenMask(nn.Module):
-    def __init__(self, dim, output_dim=4, res_norm='adain', activ='relu', pad_type='zero'):
-        super(GenMask, self).__init__()
+if __name__ == "__main__":
+    # sanity check: run a small volume through the generator and discriminator end to end.
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    x = torch.rand(2, 1, 80, 96, 72, device=device)
 
-        self.model = []
-        # AdaIN residual blocks
-        # use reflection padding in the last conv layer
-        for _ in range(2):
-            self.model += [
-                Conv2dBlock(dim, output_dim, 5, 1, 2, norm='none', activation='relu', pad_type=pad_type),
-                nn.MaxPool2d(2)]  # tanh
-            dim = output_dim
-            output_dim *= 4
+    gen_params = {'dim': 8, 'n_downsample': 2, 'n_res': 2, 'activ': 'relu', 'pad_type': 'reflect'}
+    gen = VAEGen(1, gen_params).to(device)
+    content = gen.encode_cont(x)
+    style = gen.encode_sty(x)
+    recon = gen.decode_cont(content)
+    recon_style = gen.decode_recs(torch.cat([content, style], dim=1))
+    print(f"content: {tuple(content.shape)}  style: {tuple(style.shape)}")
+    print(f"decode_cont: {tuple(recon.shape)}  decode_recs: {tuple(recon_style.shape)}")
+    assert recon.shape == x.shape == recon_style.shape
 
-        output_dim //= 16
-
-        self.model += [nn.Upsample(scale_factor=2),
-            Conv2dBlock(dim, output_dim, 5, 1, 2, norm='none', activation='relu', pad_type=pad_type)]  # tanh
-
-        dim = output_dim
-        output_dim //= 4
-        self.model += [nn.Upsample(scale_factor=2),
-                      Conv2dBlock(dim, output_dim, 5, 1, 2, norm='none', activation='sigmoid', pad_type=pad_type)]  # tanh
-        self.model = nn.Sequential(*self.model)
-
-    # 1: max1/3 and (4/9,5/9)
-    # def forward(self, x):
-    #     x = self.model(x)
-    #     mask = torch.zeros_like(x)
-    #     x = x.mean(3).view(x.shape[0], x.shape[1], x.shape[2], 1)
-    #
-    #     # find 1/3 lines and make them 1
-    #     num = x.shape[2] *1//3
-    #     values, indices = torch.topk(x, num, dim=2, largest=True)
-    #     mask[:,:,indices,:] = 1
-    #
-    #     # make mid 1/9 lines 1
-    #     start = x.shape[2] * 4 // 9
-    #     end = x.shape[2] * 5 // 9
-    #     mask[:,:, start:end, :] = 1
-    #     # mask = torch.repeat_interleave(x, 128, dim=3)
-    #     return mask.to(torch.complex64)
-
-    # 1: x>0.5 and (4/9,5/9)
-    def forward(self, x):
-        x = self.model(x)
-        mask = torch.zeros_like(x)
-        x = x.mean(3).view(x.shape[0], x.shape[1], x.shape[2], 1)
-
-        # normolize
-        for i in range(x.shape[0]):
-            for j in range(x.shape[1]):
-                x_min = torch.min(x[i,j,:,:])
-                x_max = torch.max(x[i,j,:,:])
-                x[i,j,:,:] = (x[i,j,:,:] - x_min) / (x_max - x_min)
-
-        start = x.shape[2] * 4 // 9
-        end = x.shape[2] * 5 // 9
-        for i in range(x.shape[0]):
-            for j in range(x.shape[1]):
-                for k in range(x.shape[2]):
-                    if x[i,j,k,0]>0.5 or start<k<end:
-                        mask[i,j,k,:] = 1
-
-        # make mid 1/9 lines 1
-        # mask[:, :, start:end, :] = 1
-        # mask = torch.repeat_interleave(x, 128, dim=3)
-        return mask.to(torch.complex64)
-
-def make_mask(inp, R, gpuid):
-    """
-    Make subsampling mask (1D Cartesian trajectory, Gaussian random sampling)
-    :param inp: 3D (HWC) output numpy array
-    :param R: integer, downsampling rate
-    :return: 3D (HWC) output numpy array
-    """
-    nY = inp.shape[2]
-    nX = inp.shape[3]
-    nC = inp.shape[1]
-    nB = inp.shape[0]
-    mask = np.zeros((nY, nX), dtype=np.complex64)
-    masks = np.zeros(inp.shape, dtype=np.complex64)
-    # masks = np.ones(inp.shape, dtype=np.complex64)
-
-    for i in range(nB):
-        for j in range(nC):
-            nACS = round(nY / (R ** 2))
-            ACS_s = round((nY - nACS) / 2)
-            ACS_e = ACS_s + nACS
-            mask[ACS_s:ACS_e, :] = 1
-
-            nSamples = int(nY / R)
-            r = np.floor(np.random.normal(nY / 2, 70, nSamples))
-            r = np.clip(r.astype(int), 0, nY - 1)
-            mask[r.tolist(), :] = 1
-            masks[i, j, :, :] = mask
-
-
-
-    masks = torch.from_numpy(masks)
-
-    return masks.to(device=gpuid)
-
-# downsampling
-def downsampling(img, mask):
-    h = img.shape[2]
-    w = img.shape[3]
-    k_full = fft.fftn(img, dim=(2,3))
-    k_full = torch.roll(k_full, (h//2, w//2), dims=(2,3))   # make zero frequency center
-    k_down = torch.multiply(k_full, mask)
-    k_down = torch.roll(k_down, (h//2, w//2), dims=(2,3))
-    img_down = fft.ifftn(k_down, dim=(2,3))
-
-    return img_down.to(torch.float32)
-
-# fft
-def img2k(img):
-    h = img.shape[2]
-    w = img.shape[3]
-    k_full = fft.fftn(img, dim=(2, 3))
-    k_full = torch.roll(k_full, (h // 2, w // 2), dims=(2, 3))  # make zero frequency center
-
-    return k_full
-
-# ifft
-def k2img(k_down):
-    h = k_down.shape[2]
-    w = k_down.shape[3]
-    k_down = torch.roll(k_down, (h // 2, w // 2), dims=(2, 3))
-    img_down = fft.ifftn(k_down, dim=(2, 3))
-
-    return img_down.to(torch.float32)
+    dis_params = {'n_layer': 2, 'gan_type': 'lsgan', 'dim': 8, 'norm': 'none', 'activ': 'lrelu',
+                  'num_scales': 2, 'pad_type': 'reflect'}
+    dis = MsImageDis(1, dis_params).to(device)
+    scores = dis(x)
+    print(f"discriminator scales: {[tuple(s.shape) for s in scores]}")
